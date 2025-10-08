@@ -1,0 +1,21 @@
+# Render deployment configuration for Telegram File-to-Link Bot
+services:
+  - type: web
+    name: telegram-file-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: telegram-bot-disk
+      mountPath: /opt/render/project/src/sessions
+      sizeGB: 1

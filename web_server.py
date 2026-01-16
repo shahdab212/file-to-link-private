@@ -321,13 +321,21 @@ class FileServer:
             
             # Generate VLC URL (Android intent)
             vlc_url = Config.get_vlc_android_url(file_id, display_name)
-            # Generate VLC URL (Desktop - vlc:// scheme with absolute URL)
-            # This avoids the "playlist download" issue by passing the direct link to VLC if handlers are set up
-            vlc_desktop_url = f"vlc://{absolute_stream_url}"
+             # Generate absolute URL for external players and copy link
+            absolute_stream_url = Config.get_stream_url(file_id, filename)
+            # Generate relative URL for the internal player to avoid Mixed Content (HTTP vs HTTPS) issues
+            # access path starts with /stream/... 
+            import urllib.parse
+            safe_filename = urllib.parse.quote(filename, safe='')
+            relative_stream_url = f"/stream/{file_id}/{safe_filename}"
+            
+            download_url = Config.get_download_url(file_id, filename)
+            vlc_url = Config.get_vlc_android_url(file_id, filename)
+            vlc_desktop_url = Config.get_vlc_desktop_url(file_id, filename)
             
             # Generate HTML player page
             html_content = self._generate_player_html(
-                display_name, file_size, absolute_stream_url, download_url, is_video, is_audio, compatibility_info, vlc_url, vlc_desktop_url
+                display_name, file_size, absolute_stream_url, relative_stream_url, download_url, is_video, is_audio, compatibility_info, vlc_url, vlc_desktop_url
             )
             
             return web.Response(
@@ -342,7 +350,7 @@ class FileServer:
             logger.error(f"Error creating web player for {file_id}: {e}")
             raise web.HTTPInternalServerError(text="Internal server error")
     
-    def _generate_player_html(self, filename: str, file_size: str, stream_url: str, 
+    def _generate_player_html(self, filename: str, file_size: str, stream_url: str, relative_stream_url: str,
                             download_url: str, is_video: bool, is_audio: bool, compatibility_info: dict, 
                             vlc_url: str, vlc_desktop_url: str) -> str:
         """Generate HTML for the web player"""

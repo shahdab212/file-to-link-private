@@ -195,7 +195,7 @@
         });
 
         function copyLink() {
-            var url = '{stream_url}';
+            var url = '{absolute_stream_url}';
             navigator.clipboard.writeText(url).then(() => {
                 alert('Stream URL copied!');
             }).catch(() => {

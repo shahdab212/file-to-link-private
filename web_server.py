@@ -456,10 +456,19 @@ class FileServer:
             request_size = end - start + 1
             chunk_limit = min(Config.CHUNK_SIZE, max(1024 * 256, request_size)) if request_size < Config.CHUNK_SIZE else Config.CHUNK_SIZE
             
-            async for chunk in self.bot.stream_media(file_info['message'], limit=chunk_limit):
+            # Optimization: Skip to the nearest 1MB chunk to avoid downloading from start
+            # Pyrogram's stream_media 'offset' parameter works in 1MB chunks (usually)
+            # We use a safety margin of 0 to ensure we don't skip past the start
+            telegram_chunk_size = 1048576  # 1MB
+            skip_chunks = start // telegram_chunk_size
+            
+            # Initialize current_pos to where we are actually starting
+            current_pos = skip_chunks * telegram_chunk_size
+            
+            async for chunk in self.bot.stream_media(file_info['message'], limit=chunk_limit, offset=skip_chunks):
                 chunk_end = current_pos + len(chunk)
                 
-                # Skip chunks before the requested range
+                # Skip chunks before the requested range (refinement)
                 if chunk_end <= start:
                     current_pos = chunk_end
                     continue

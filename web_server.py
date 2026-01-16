@@ -408,14 +408,13 @@ class FileServer:
             html = html.replace('{media_icon}', media_icon)
             html = html.replace('{media_type}', media_type)
             html = html.replace('{file_size}', file_size)
-            html = html.replace('{mime_type_short}', mime_type.split('/')[-1].upper()) # Added this line to replace mime_type_short
+            html = html.replace('{mime_type_short}', mime_type.split('/')[-1].upper())
             html = html.replace('{compatibility}', compatibility.title())
             html = html.replace('{compatibility_warning}', compatibility_warning)
             html = html.replace('{player_element}', player_element)
             html = html.replace('{download_url}', download_url)
-            html = html.replace('{download_url}', download_url)
-            html = html.replace('{download_url}', download_url)
-            html = html.replace('{stream_url}', stream_url)
+            html = html.replace('{stream_url}', relative_stream_url)  # Use relative URL for player
+            html = html.replace('{absolute_stream_url}', stream_url) # Use absolute URL for copy link
             html = html.replace('{vlc_url}', vlc_url)
             html = html.replace('{vlc_desktop_url}', vlc_desktop_url)
             
@@ -445,6 +444,7 @@ class FileServer:
             response.set_status(206)  # Partial Content
             response.headers['Content-Range'] = f'bytes {start}-{end}/{file_info["file_size"]}'
             response.headers['Content-Length'] = str(end - start + 1)
+            response.headers['Accept-Ranges'] = 'bytes'
             
             await response.prepare(request)
             

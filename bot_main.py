@@ -7,12 +7,21 @@ import asyncio
 import logging
 import hashlib
 from typing import Optional
+
+# Workaround for Pyrogram sync magic on Python 3.10+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait, MessageNotModified
 from config import Config
 from web_server import start_web_server
 from utils.media_utils import MediaProcessor
+from utils.crypto_utils import CryptoUtils
+from messages import Messages
 
 # Configure logging
 logging.basicConfig(
@@ -35,8 +44,9 @@ class FileLinkBot:
         self.user_states = {}  # Track user states for channel verification
         
     def generate_file_id(self, message: Message) -> str:
-        """Generate a unique file ID for the message"""
-        return f"{message.chat.id}_{message.id}"
+        """Generate a unique secure file ID for the message"""
+        raw_id = f"{message.chat.id}_{message.id}"
+        return CryptoUtils.encrypt_id(raw_id)
     
     def get_file_info(self, message: Message) -> Optional[dict]:
         """Extract file information from message"""
@@ -180,36 +190,16 @@ class FileLinkBot:
             user_id = message.from_user.id
             
             # Build welcome text
-            welcome_text = (
-                "🤖 **Welcome to File-to-Link Bot!**\n\n"
-                "📁 I can generate direct download and streaming links for your Telegram files.\n\n"
-            )
+            welcome_text = Messages.WELCOME
             
             # Add polite channel join suggestion if channel is configured
             if Config.TELEGRAM_CHANNEL:
                 # Check if user is already a member (just for the personalized message)
                 is_member = await self.check_channel_membership(user_id)
                 if not is_member:
-                    welcome_text += (
-                        "💡 **Stay Updated!**\n"
-                        "Join our update channel to get notified about new features and updates!\n\n"
-                    )
+                    welcome_text += Messages.JOIN_CHANNEL
             
-            welcome_text += (
-                "**How to use:**\n"
-                "1. Forward or send any video, audio, or document file\n"
-                "2. Reply to that message with `/dl`, `/dlink`, `.dl`, or `.dlink`\n"
-                "3. Get instant download and streaming links!\n\n"
-                "**Supported files:**\n"
-                "• 📹 Videos (up to 4GB)\n"
-                "• 🎵 Audio files\n"
-                "• 📄 Documents\n\n"
-                "**Features:**\n"
-                "• ⚡ Fast streaming without downloading\n"
-                "• 📱 Mobile-friendly links\n"
-                "• 🔒 Secure file handling\n\n"
-                "Try it now by sending a file and replying with any download command!"
-            )
+            welcome_text += Messages.USAGE_INSTRUCTIONS
             
             # Create keyboard with help, about, and join channel buttons
             keyboard_buttons = [
@@ -233,32 +223,7 @@ class FileLinkBot:
         @self.bot.on_message(filters.command("help"))
         async def help_command(client: Client, message: Message):
             """Handle /help command"""
-            help_text = (
-                "📖 **Help - How to Use File-to-Link Bot**\n\n"
-                "**Step-by-step guide:**\n\n"
-                "1️⃣ **Send a file**: Upload any video, audio, or document to the chat\n"
-                "2️⃣ **Reply with a download command**: Reply to the file message with `/dl`, `/dlink`, `.dl`, or `.dlink`\n"
-                "3️⃣ **Get your links**: Receive download and streaming links instantly!\n\n"
-                "**Available commands:**\n"
-                "• `/dl` - Generate download links\n"
-                "• `/dlink` - Generate download links\n"
-                "• `.dl` - Generate download links\n"
-                "• `.dlink` - Generate download links\n\n"
-                "**Supported file types:**\n"
-                "• 🎬 Video files (.mp4, .mkv, .avi, etc.)\n"
-                "• 🎵 Audio files (.mp3, .flac, .wav, etc.)\n"
-                "• 📄 Document files (.pdf, .zip, .apk, etc.)\n\n"
-                "**File size limit:** Up to 4GB per file\n\n"
-                "**Example usage:**\n"
-                "```\n"
-                "User: [sends video.mp4]\n"
-                "User: /dl (as reply to the video)\n"
-                "Bot: [generates links with buttons]\n"
-                "```\n\n"
-                "**Need more help?** Contact support or check our documentation."
-            )
-            
-            await message.reply_text(help_text)
+            await message.reply_text(Messages.HELP_TEXT)
         
         @self.bot.on_message(filters.command(["dl", "dlink"]) | filters.regex(r"^\.dl$|^\.dlink$"))
         async def fdl_command(client: Client, message: Message):
@@ -266,38 +231,24 @@ class FileLinkBot:
             try:
                 # Check if this is a reply to a message
                 if not message.reply_to_message:
-                    await message.reply_text(
-                        "❌ **Please reply to a file message with a download command**\n\n"
-                        "📝 **How to use:**\n"
-                        "1. Find a message with a video, audio, or document\n"
-                        "2. Reply to that message with `/dl`, `/dlink`, `.dl`, or `.dlink`\n"
-                        "3. Get your download links!\n\n"
-                        "💡 **Tip:** You can forward files from other chats and then use any download command"
-                    )
+                    await message.reply_text(Messages.ERR_NO_REPLY)
                     return
                 
                 replied_message = message.reply_to_message
                 file_info = self.get_file_info(replied_message)
                 
                 if not file_info:
-                    await message.reply_text(
-                        "❌ **No supported file found!**\n\n"
-                        "📁 **Supported file types:**\n"
-                        "• 📹 Videos\n"
-                        "• 🎵 Audio files\n"
-                        "• 📄 Documents\n\n"
-                        "Please reply to a message containing one of these file types."
-                    )
+                    await message.reply_text(Messages.ERR_NO_FILE)
                     return
                 
                 # Check file size
                 if file_info['size'] > Config.MAX_FILE_SIZE:
                     max_size_formatted = self.format_file_size(Config.MAX_FILE_SIZE)
                     await message.reply_text(
-                        f"❌ **File too large!**\n\n"
-                        f"📏 **File size:** {self.format_file_size(file_info['size'])}\n"
-                        f"📏 **Maximum allowed:** {max_size_formatted}\n\n"
-                        "Please try with a smaller file."
+                        Messages.ERR_FILE_TOO_LARGE.format(
+                            size=self.format_file_size(file_info['size']),
+                            max_size=max_size_formatted
+                        )
                     )
                     return
                 
@@ -329,21 +280,23 @@ class FileLinkBot:
                     is_streamable = file_info['type'] in ['video', 'audio']
                 
                 # Create response message with new format
-                response_text = (
-                    f"📝 **File Name:** {file_info['name']}\n"
-                    f"📏 **File Size:** {self.format_file_size(file_info['size'])}\n"
-                    f"🗂️ **File Type:** {file_type_display}\n"
-                    f"🔗 **MIME Type:** {file_info['mime_type']}\n"
+                response_text = Messages.RESPONSE_TEMPLATE_HEADER.format(
+                    name=file_info['name'],
+                    size=self.format_file_size(file_info['size']),
+                    type=file_type_display,
+                    mime=file_info['mime_type']
                 )
                 
                 # Add streamable info and links only for streamable files
                 if is_streamable:
-                    response_text += f"🎵 **Streamable:** Yes\n\n"
-                    response_text += f"📥 **Download:** `{enhanced_urls['download_named']}`\n\n"
-                    response_text += f"🎵 **Stream:** `{enhanced_urls['stream_named']}`\n\n"
-                    response_text += f"💡 **Tip:** Use the Web Stream button for web player or copy the Stream URL for VLC"
+                    response_text += Messages.RESPONSE_STREAMABLE.format(
+                        download_url=enhanced_urls['download_named'],
+                        stream_url=enhanced_urls['stream_named']
+                    )
                 else:
-                    response_text += f"\n📥 **Download:** `{enhanced_urls['download_named']}`"
+                    response_text += Messages.RESPONSE_DOWNLOAD_ONLY.format(
+                        download_url=enhanced_urls['download_named']
+                    )
                 
                 # Create keyboard based on file type
                 if is_streamable:
@@ -373,11 +326,7 @@ class FileLinkBot:
                 await asyncio.sleep(e.value)
             except Exception as e:
                 logger.error(f"Error in fdl_command: {e}", exc_info=True)
-                await message.reply_text(
-                    "❌ **An error occurred while processing your request.**\n\n"
-                    "Please try again in a few moments. If the problem persists, "
-                    "contact support with the error details."
-                )
+                await message.reply_text(Messages.ERR_GENERIC)
         
         @self.bot.on_callback_query()
         async def handle_callbacks(client: Client, callback_query):
@@ -386,29 +335,14 @@ class FileLinkBot:
                 data = callback_query.data
                 
                 if data == "help":
-                    help_text = (
-                        "📖 **Quick Help**\n\n"
-                        "1. Send or forward a file\n"
-                        "2. Reply to it with `/dl`\n"
-                        "3. Get download links!\n\n"
-                        "Supported: Videos, Audio, Documents"
-                    )
-                    await callback_query.answer(help_text, show_alert=True)
+                    await callback_query.answer(Messages.QUICK_HELP, show_alert=True)
                 
                 elif data == "about":
-                    about_text = (
-                        "ℹ️ **About File-to-Link Bot**\n\n"
-                        "🚀 High-performance Telegram file linking service\n"
-                        "⚡ Built with Pyrogram + AIOHTTP\n"
-                        "🔒 Secure and efficient file streaming\n"
-                        "📱 Mobile-friendly interface\n\n"
-                        "Version: 1.0.0"
-                    )
-                    await callback_query.answer(about_text, show_alert=True)
+                    await callback_query.answer(Messages.ABOUT_TEXT, show_alert=True)
                 
             except Exception as e:
                 logger.error(f"Error in callback handler: {e}")
-                await callback_query.answer("❌ An error occurred. Please try again.", show_alert=True)
+                await callback_query.answer(Messages.ERR_CALLBACK, show_alert=True)
     
     async def start(self):
         """Start the bot and web server"""

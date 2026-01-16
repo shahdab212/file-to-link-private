@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import Config
 from utils.media_utils import MediaProcessor
+from utils.crypto_utils import CryptoUtils
 
 # Configure logging
 logging.basicConfig(level=getattr(logging, Config.LOG_LEVEL))
@@ -36,6 +37,37 @@ class FileServer:
         self.bot = bot_client
         self.file_cache = {}  # In-memory cache for file metadata
         self.media_processor = MediaProcessor()
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+    
+    async def _cleanup_loop(self):
+        """Background task to clean up expired cache entries"""
+        while True:
+            try:
+                await asyncio.sleep(600)  # Run every 10 minutes
+                current_time = time.time()
+                expired_keys = [
+                    k for k, v in self.file_cache.items() 
+                    if current_time - v['cached_at'] > 3600  # Expire after 1 hour
+                ]
+                
+                for key in expired_keys:
+                    del self.file_cache[key]
+                
+                if expired_keys:
+                    logger.info(f"Cleaned up {len(expired_keys)} expired cache entries")
+                    
+            except Exception as e:
+                logger.error(f"Error in cache cleanup loop: {e}")
+                await asyncio.sleep(60)
+
+    async def cleanup(self):
+        """Cleanup resources"""
+        if hasattr(self, '_cleanup_task'):
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
         
     async def get_file_info(self, file_id: str) -> Optional[Dict[str, Any]]:
         """Get file information from Telegram"""
@@ -47,10 +79,23 @@ class FileServer:
                 if time.time() - cached_info['cached_at'] < 600:
                     return cached_info['data']
             
+            # Try to decrypt ID, otherwise treat as legacy raw ID (backward compatibility)
+            decrypted_id = CryptoUtils.decrypt_id(file_id)
+            target_id = decrypted_id if decrypted_id else file_id
+            
+            try:
+                chat_id_str, message_id_str = target_id.split('_')
+                chat_id = int(chat_id_str)
+                message_id = int(message_id_str)
+            except ValueError:
+                # Invalid ID format
+                logger.warning(f"Invalid file ID format: {file_id} (decrypted: {decrypted_id})")
+                return None
+
             # Get file from Telegram
             message = await self.bot.get_messages(
-                chat_id=int(file_id.split('_')[0]),
-                message_ids=int(file_id.split('_')[1])
+                chat_id=chat_id,
+                message_ids=message_id
             )
             
             if not message or not (message.document or message.video or message.audio or message.photo):
@@ -204,6 +249,39 @@ class FileServer:
             logger.error(f"Error creating direct link for {file_id}: {e}")
             raise web.HTTPInternalServerError(text="Internal server error")
     
+    async def playlist(self, request: web.Request) -> web.Response:
+        """Generate M3U playlist for external players"""
+        file_id = request.match_info['file_id']
+        filename = request.match_info.get('filename', '')
+        
+        try:
+            file_info = await self.get_file_info(file_id)
+            if not file_info:
+                raise web.HTTPNotFound(text="File not found")
+            
+            # Generate stream URL
+            if filename:
+                from urllib.parse import quote
+                safe_filename = quote(filename, safe='')
+                stream_url = f"{Config.BASE_URL}/stream/{file_id}/{safe_filename}"
+            else:
+                stream_url = f"{Config.BASE_URL}/stream/{file_id}"
+                
+            # Content of M3U file
+            m3u_content = f"#EXTM3U\n#EXTINF:-1,{filename or file_info['file_name']}\n{stream_url}"
+            
+            return web.Response(
+                text=m3u_content, 
+                content_type='audio/x-mpegurl',
+                headers={'Content-Disposition': f'attachment; filename="playlist.m3u"'}
+            )
+            
+        except web.HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error creating playlist for {file_id}: {e}")
+            raise web.HTTPInternalServerError(text="Internal server error")
+
     async def web_player(self, request: web.Request) -> web.Response:
         """Web player interface for streaming files"""
         file_id = request.match_info['file_id']
@@ -217,8 +295,16 @@ class FileServer:
             # Get file details
             display_name = unquote(filename) if filename else file_info['file_name']
             file_size = self.media_processor.format_file_size(file_info['file_size'])
-            stream_url = f"/stream/{file_id}/{filename}" if filename else f"/stream/{file_id}"
-            download_url = f"/download/{file_id}/{filename}" if filename else f"/download/{file_id}"
+            # Create Safe/Absolute URLs
+            from urllib.parse import quote
+            safe_filename = quote(display_name, safe='')
+            
+            # Absolute URL for external players and copy link
+            absolute_stream_url = f"{Config.BASE_URL}/stream/{file_id}/{safe_filename}"
+            
+            # Relative URL for internal player (keeps it cleaner, but could use absolute too)
+            stream_url = f"/stream/{file_id}/{safe_filename}"
+            download_url = f"/download/{file_id}/{safe_filename}"
             
             # Check if file is streamable using proper detection
             is_streamable = self.media_processor.is_streamable(display_name, file_info.get('mime_type'))
@@ -233,12 +319,22 @@ class FileServer:
             # Get browser compatibility info
             compatibility_info = self.media_processor.get_browser_compatibility_info(display_name)
             
+            # Generate VLC URL (Android intent)
+            vlc_url = Config.get_vlc_android_url(file_id, display_name)
+            # Generate VLC URL (Desktop - vlc:// scheme with absolute URL)
+            # This avoids the "playlist download" issue by passing the direct link to VLC if handlers are set up
+            vlc_desktop_url = f"vlc://{absolute_stream_url}"
+            
             # Generate HTML player page
             html_content = self._generate_player_html(
-                display_name, file_size, stream_url, download_url, is_video, is_audio, compatibility_info
+                display_name, file_size, absolute_stream_url, download_url, is_video, is_audio, compatibility_info, vlc_url, vlc_desktop_url
             )
             
-            return web.Response(text=html_content, content_type='text/html')
+            return web.Response(
+                text=html_content, 
+                content_type='text/html',
+                headers={'Cache-Control': 'no-cache, no-store, must-revalidate'}
+            )
             
         except web.HTTPException:
             raise
@@ -247,7 +343,8 @@ class FileServer:
             raise web.HTTPInternalServerError(text="Internal server error")
     
     def _generate_player_html(self, filename: str, file_size: str, stream_url: str, 
-                            download_url: str, is_video: bool, is_audio: bool, compatibility_info: dict) -> str:
+                            download_url: str, is_video: bool, is_audio: bool, compatibility_info: dict, 
+                            vlc_url: str, vlc_desktop_url: str) -> str:
         """Generate HTML for the web player"""
         
         # Get proper MIME type
@@ -291,489 +388,34 @@ class FileServer:
             media_icon = "🎵"
             media_type = "Audio"
         
-        html_template = f'''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{filename}</title>
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-            color: white;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }}
-        
-        .container {{
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 30px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            text-align: center;
-            max-width: 800px;
-            width: 100%;
-        }}
-        
-        .header {{
-            margin-bottom: 30px;
-        }}
-        
-        .file-icon {{
-            font-size: 3rem;
-            margin-bottom: 15px;
-        }}
-        
-        .file-name {{
-            font-size: 1.5rem;
-            font-weight: 600;
-            margin-bottom: 10px;
-            word-break: break-word;
-        }}
-        
-        .file-info {{
-            font-size: 1rem;
-            opacity: 0.8;
-            margin-bottom: 5px;
-        }}
-        
-        .player-container {{
-            margin: 30px 0;
-            display: flex;
-            justify-content: center;
-        }}
-        
-        video, audio {{
-            border-radius: 10px;
-            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
-        }}
-        
-        .controls {{
-            display: flex;
-            gap: 15px;
-            justify-content: center;
-            flex-wrap: wrap;
-            margin-top: 30px;
-        }}
-        
-        .btn {{
-            background: rgba(255, 255, 255, 0.2);
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            color: white;
-            padding: 12px 24px;
-            border-radius: 25px;
-            text-decoration: none;
-            font-weight: 500;
-            transition: all 0.3s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-        }}
-        
-        .btn:hover {{
-            background: rgba(255, 255, 255, 0.3);
-            transform: translateY(-2px);
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-        }}
-        
-        .btn-primary {{
-            background: rgba(74, 144, 226, 0.8);
-            border-color: rgba(74, 144, 226, 1);
-        }}
-        
-        .btn-primary:hover {{
-            background: rgba(74, 144, 226, 1);
-        }}
-        
-        .footer {{
-            margin-top: 30px;
-            font-size: 0.9rem;
-            opacity: 0.7;
-        }}
-        
-        .compatibility-warning {{
-            background: rgba(255, 193, 7, 0.2);
-            border: 1px solid rgba(255, 193, 7, 0.5);
-            border-radius: 10px;
-            padding: 15px;
-            margin: 20px 0;
-            font-size: 0.9rem;
-            text-align: left;
-        }}
-        
-        .compatibility-info {{
-            background: rgba(23, 162, 184, 0.2);
-            border: 1px solid rgba(23, 162, 184, 0.5);
-            border-radius: 10px;
-            padding: 15px;
-            margin: 20px 0;
-            font-size: 0.9rem;
-            text-align: left;
-        }}
-        
-        .download-link {{
-            color: #ffd700;
-            text-decoration: underline;
-        }}
-        
-        .download-link:hover {{
-            color: #ffed4e;
-        }}
-        
-        .format-info {{
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 8px;
-            padding: 10px;
-            margin: 15px 0;
-            font-size: 0.85rem;
-            opacity: 0.8;
-        }}
-        
-        @media (max-width: 768px) {{
-            .container {{
-                padding: 20px;
-                margin: 10px;
-            }}
+        # Load template
+        try:
+            template_path = Path(__file__).parent / 'templates' / 'player.html'
+            with open(template_path, 'r', encoding='utf-8') as f:
+                template = f.read()
             
-            .file-name {{
-                font-size: 1.2rem;
-            }}
+            # Use simple string replacement to avoid issues with CSS/JS curly braces
+            html = template
+            html = html.replace('{filename}', filename)
+            html = html.replace('{media_icon}', media_icon)
+            html = html.replace('{media_type}', media_type)
+            html = html.replace('{file_size}', file_size)
+            html = html.replace('{mime_type_short}', mime_type.split('/')[-1].upper()) # Added this line to replace mime_type_short
+            html = html.replace('{compatibility}', compatibility.title())
+            html = html.replace('{compatibility_warning}', compatibility_warning)
+            html = html.replace('{player_element}', player_element)
+            html = html.replace('{download_url}', download_url)
+            html = html.replace('{download_url}', download_url)
+            html = html.replace('{download_url}', download_url)
+            html = html.replace('{stream_url}', stream_url)
+            html = html.replace('{vlc_url}', vlc_url)
+            html = html.replace('{vlc_desktop_url}', vlc_desktop_url)
             
-            video, audio {{
-                max-width: 100% !important;
-            }}
+            return html
             
-            .controls {{
-                flex-direction: column;
-                align-items: center;
-            }}
-            
-            .btn {{
-                width: 200px;
-                justify-content: center;
-            }}
-        }}
-        
-        @media (max-width: 480px) {{
-            .container {{
-                padding: 15px;
-                margin: 5px;
-            }}
-            
-            .file-name {{
-                font-size: 1.1rem;
-            }}
-            
-            .file-icon {{
-                font-size: 2.5rem;
-            }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <div class="file-icon">{media_icon}</div>
-            <div class="file-name">{filename}</div>
-            <div class="file-info">{media_type} • {file_size}</div>
-        </div>
-        
-        <div class="format-info">
-            📄 <strong>Format:</strong> {mime_type.split('/')[-1].upper()} • 
-            🌐 <strong>Browser Support:</strong> {compatibility.title()}
-        </div>
-        
-        {compatibility_warning}
-        
-        <div class="player-container">
-            {player_element}
-        </div>
-        
-        <div class="controls">
-            <a href="{download_url}" class="btn btn-primary">
-                📥 Download
-            </a>
-            <a href="{stream_url}" class="btn" target="_blank">
-                🔗 Direct Link
-            </a>
-            <button onclick="copyToClipboard('{stream_url}')" class="btn">
-                📋 Copy Link
-            </button>
-        </div>
-        
-        <div class="footer">
-            <p>🤖 Powered by Telegram File-to-Link Bot</p>
-        </div>
-    </div>
-    
-    <script>
-        function copyToClipboard(text) {{
-            const fullUrl = window.location.origin + text;
-            const btn = event.target;
-            const originalText = btn.innerHTML;
-            
-            // Method 1: Try modern clipboard API (works on HTTPS)
-            if (navigator.clipboard && window.isSecureContext) {{
-                navigator.clipboard.writeText(fullUrl).then(function() {{
-                    showCopySuccess(btn, originalText);
-                }}).catch(function(err) {{
-                    console.warn('Clipboard API failed, trying fallback:', err);
-                    fallbackCopyToClipboard(fullUrl, btn, originalText);
-                }});
-            }} else {{
-                // Method 2: Use fallback for HTTP or unsupported browsers
-                fallbackCopyToClipboard(fullUrl, btn, originalText);
-            }}
-        }}
-        
-        function fallbackCopyToClipboard(text, btn, originalText) {{
-            // Create a temporary textarea element
-            const textArea = document.createElement("textarea");
-            textArea.value = text;
-            
-            // Make it invisible but still selectable
-            textArea.style.position = "fixed";
-            textArea.style.top = "0";
-            textArea.style.left = "0";
-            textArea.style.width = "2em";
-            textArea.style.height = "2em";
-            textArea.style.padding = "0";
-            textArea.style.border = "none";
-            textArea.style.outline = "none";
-            textArea.style.boxShadow = "none";
-            textArea.style.background = "transparent";
-            textArea.style.opacity = "0";
-            
-            document.body.appendChild(textArea);
-            textArea.focus();
-            textArea.select();
-            
-            try {{
-                // Try the older execCommand method
-                const successful = document.execCommand('copy');
-                if (successful) {{
-                    showCopySuccess(btn, originalText);
-                }} else {{
-                    showManualCopyDialog(text);
-                }}
-            }} catch (err) {{
-                console.error('Fallback copy failed:', err);
-                showManualCopyDialog(text);
-            }}
-            
-            document.body.removeChild(textArea);
-        }}
-        
-        function showCopySuccess(btn, originalText) {{
-            btn.innerHTML = '✅ Copied!';
-            btn.style.background = 'rgba(46, 204, 113, 0.8)';
-            
-            setTimeout(() => {{
-                btn.innerHTML = originalText;
-                btn.style.background = '';
-            }}, 2000);
-        }}
-        
-        function showManualCopyDialog(text) {{
-            // Create a modal dialog for manual copying
-            const modal = document.createElement('div');
-            modal.style.cssText = `
-                position: fixed;
-                top: 50%;
-                left: 50%;
-                transform: translate(-50%, -50%);
-                background: rgba(30, 30, 30, 0.95);
-                backdrop-filter: blur(10px);
-                border: 1px solid rgba(255, 255, 255, 0.2);
-                border-radius: 15px;
-                padding: 25px;
-                z-index: 10000;
-                max-width: 90%;
-                width: 500px;
-                box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
-            `;
-            
-            modal.innerHTML = `
-                <div style="color: white; text-align: center;">
-                    <h3 style="margin: 0 0 15px 0; font-size: 1.2rem;">📋 Copy Link</h3>
-                    <p style="margin: 0 0 15px 0; opacity: 0.9; font-size: 0.9rem;">
-                        Select and copy the link below:
-                    </p>
-                    <input type="text" value="${{text}}" readonly style="
-                        width: 100%;
-                        padding: 10px;
-                        border: 1px solid rgba(255, 255, 255, 0.3);
-                        border-radius: 8px;
-                        background: rgba(255, 255, 255, 0.1);
-                        color: white;
-                        font-family: monospace;
-                        font-size: 0.85rem;
-                        margin-bottom: 15px;
-                        cursor: text;
-                    " onclick="this.select();" id="copyInput">
-                    <div style="display: flex; gap: 10px; justify-content: center;">
-                        <button onclick="
-                            document.getElementById('copyInput').select();
-                            document.execCommand('copy');
-                            this.innerHTML = '✅ Copied!';
-                            this.style.background = 'rgba(46, 204, 113, 0.8)';
-                            setTimeout(() => {{
-                                document.body.removeChild(this.closest('div').parentElement);
-                            }}, 1500);
-                        " style="
-                            background: rgba(74, 144, 226, 0.8);
-                            border: 1px solid rgba(74, 144, 226, 1);
-                            color: white;
-                            padding: 8px 20px;
-                            border-radius: 20px;
-                            cursor: pointer;
-                            font-weight: 500;
-                            transition: all 0.3s ease;
-                        " onmouseover="this.style.background='rgba(74, 144, 226, 1)'" 
-                          onmouseout="this.style.background='rgba(74, 144, 226, 0.8)'">
-                            Copy
-                        </button>
-                        <button onclick="document.body.removeChild(this.closest('div').parentElement);" style="
-                            background: rgba(255, 255, 255, 0.2);
-                            border: 1px solid rgba(255, 255, 255, 0.3);
-                            color: white;
-                            padding: 8px 20px;
-                            border-radius: 20px;
-                            cursor: pointer;
-                            font-weight: 500;
-                            transition: all 0.3s ease;
-                        " onmouseover="this.style.background='rgba(255, 255, 255, 0.3)'" 
-                          onmouseout="this.style.background='rgba(255, 255, 255, 0.2)'">
-                            Close
-                        </button>
-                    </div>
-                </div>
-            `;
-            
-            document.body.appendChild(modal);
-            
-            // Auto-select the text in the input
-            const input = document.getElementById('copyInput');
-            if (input) {{
-                input.focus();
-                input.select();
-            }}
-        }}
-        
-        // Add keyboard shortcuts
-        document.addEventListener('keydown', function(e) {{
-            const player = document.getElementById('mediaPlayer');
-            if (!player) return;
-            
-            switch(e.code) {{
-                case 'Space':
-                    e.preventDefault();
-                    if (player.paused) {{
-                        player.play();
-                    }} else {{
-                        player.pause();
-                    }}
-                    break;
-                case 'ArrowLeft':
-                    e.preventDefault();
-                    player.currentTime = Math.max(0, player.currentTime - 10);
-                    break;
-                case 'ArrowRight':
-                    e.preventDefault();
-                    player.currentTime = Math.min(player.duration, player.currentTime + 10);
-                    break;
-                case 'ArrowUp':
-                    e.preventDefault();
-                    player.volume = Math.min(1, player.volume + 0.1);
-                    break;
-                case 'ArrowDown':
-                    e.preventDefault();
-                    player.volume = Math.max(0, player.volume - 0.1);
-                    break;
-            }}
-        }});
-        
-        // Add loading indicator and enhanced error handling
-        const player = document.getElementById('mediaPlayer');
-        if (player) {{
-            player.addEventListener('loadstart', function() {{
-                console.log('Loading started...');
-            }});
-            
-            player.addEventListener('canplay', function() {{
-                console.log('Can start playing');
-            }});
-            
-            player.addEventListener('error', function(e) {{
-                console.error('Media error:', e);
-                const errorCode = player.error ? player.error.code : 'unknown';
-                let errorMessage = 'Error loading media. ';
-                
-                switch(errorCode) {{
-                    case 1:
-                        errorMessage += 'The media loading was aborted.';
-                        break;
-                    case 2:
-                        errorMessage += 'A network error occurred.';
-                        break;
-                    case 3:
-                        errorMessage += 'The media format is not supported by your browser.';
-                        break;
-                    case 4:
-                        errorMessage += 'The media source is not suitable.';
-                        break;
-                    default:
-                        errorMessage += 'An unknown error occurred.';
-                }}
-                
-                errorMessage += ' Please try downloading the file to play it with a media player like VLC.';
-                
-                // Show error message in the player container
-                const container = document.querySelector('.player-container');
-                if (container) {{
-                    container.innerHTML = `
-                        <div style="background: rgba(220, 53, 69, 0.2); border: 1px solid rgba(220, 53, 69, 0.5); 
-                                    border-radius: 10px; padding: 20px; text-align: center;">
-                            <div style="font-size: 2rem; margin-bottom: 10px;">❌</div>
-                            <div style="font-weight: 600; margin-bottom: 10px;">Playback Error</div>
-                            <div style="font-size: 0.9rem; margin-bottom: 15px;">${{errorMessage}}</div>
-                            <a href="{download_url}" class="btn btn-primary" style="text-decoration: none;">
-                                📥 Download File
-                            </a>
-                        </div>
-                    `;
-                }}
-            }});
-            
-            // Add loading indicator
-            player.addEventListener('waiting', function() {{
-                console.log('Buffering...');
-            }});
-            
-            player.addEventListener('playing', function() {{
-                console.log('Playing...');
-            }});
-        }}
-    </script>
-</body>
-</html>
-        '''
-        
-        return html_template
+        except Exception as e:
+            logger.error(f"Error loading player template: {e}")
+            return f"Error loading player template: {e}"
     
     async def _handle_range_request(self, request: web.Request, response: web.StreamResponse, 
                                   file_info: dict, range_header: str) -> web.StreamResponse:
@@ -802,7 +444,11 @@ class FileServer:
             current_pos = 0
             bytes_sent = 0
             
-            async for chunk in self.bot.stream_media(file_info['message'], limit=Config.CHUNK_SIZE):
+            # Smart Chunking: Use smaller limit for small range requests (like probing)
+            request_size = end - start + 1
+            chunk_limit = min(Config.CHUNK_SIZE, max(1024 * 64, request_size)) if request_size < Config.CHUNK_SIZE else Config.CHUNK_SIZE
+            
+            async for chunk in self.bot.stream_media(file_info['message'], limit=chunk_limit):
                 chunk_end = current_pos + len(chunk)
                 
                 # Skip chunks before the requested range
@@ -848,6 +494,8 @@ async def create_app(bot_client: Client) -> web.Application:
     app.router.add_get('/direct/{file_id}/{filename}', file_server.direct_link)
     app.router.add_get('/play/{file_id}', file_server.web_player)
     app.router.add_get('/play/{file_id}/{filename}', file_server.web_player)
+    app.router.add_get('/playlist/{file_id}', file_server.playlist)
+    app.router.add_get('/playlist/{file_id}/{filename}', file_server.playlist)
     
     # Health check endpoint
     async def health_check(request):
@@ -862,8 +510,34 @@ async def create_app(bot_client: Client) -> web.Application:
             ]
         })
     
+    async def root_page(request):
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Bot Status</title>
+            <style>
+                body { font-family: system-ui, sans-serif; background: #121212; color: #4CAF50; display: flex; height: 100vh; justify-content: center; align-items: center; margin: 0; }
+                .status { text-align: center; }
+                h1 { font-size: 3rem; margin-bottom: 10px; }
+                p { color: #aaa; }
+                .pulse { width: 15px; height: 15px; background: #4CAF50; border-radius: 50%; display: inline-block; animation: pulse 2s infinite; margin-left: 10px; }
+                @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(76, 175, 80, 0); } 100% { box-shadow: 0 0 0 0 rgba(76, 175, 80, 0); } }
+            </style>
+        </head>
+        <body>
+            <div class="status">
+                <h1>Bot is Running<div class="pulse"></div></h1>
+                <p>Telegram File-to-Link Service is Operational</p>
+                <p style="font-size: 0.8rem; margin-top: 20px;">PING OK</p>
+            </div>
+        </body>
+        </html>
+        """
+        return web.Response(text=html, content_type='text/html')
+    
     app.router.add_get('/health', health_check)
-    app.router.add_get('/', health_check)
+    app.router.add_get('/', root_page)
     
     return app
 

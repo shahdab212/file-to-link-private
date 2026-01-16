@@ -26,7 +26,6 @@ psutil==6.0.0
 python-dateutil==2.9.0
 
 # JSON handling improvements
-orjson==3.10.7
 
 # Additional utilities
 humanize==4.10.0

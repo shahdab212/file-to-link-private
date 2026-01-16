@@ -5,6 +5,9 @@ Handles environment variables and application settings
 
 import os
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class Config:
     """Configuration class for the Telegram bot and web server"""

@@ -27,7 +27,7 @@ class Config:
     
     # File Configuration
     MAX_FILE_SIZE: int = int(os.getenv("MAX_FILE_SIZE", "4294967296"))  # 4GB in bytes
-    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "1048576"))  # 1MB chunks
+    CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "2097152"))  # 2MB chunks
     
     # Logging Configuration
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

@@ -446,7 +446,7 @@ class FileServer:
             
             # Smart Chunking: Use smaller limit for small range requests (like probing)
             request_size = end - start + 1
-            chunk_limit = min(Config.CHUNK_SIZE, max(1024 * 64, request_size)) if request_size < Config.CHUNK_SIZE else Config.CHUNK_SIZE
+            chunk_limit = min(Config.CHUNK_SIZE, max(1024 * 256, request_size)) if request_size < Config.CHUNK_SIZE else Config.CHUNK_SIZE
             
             async for chunk in self.bot.stream_media(file_info['message'], limit=chunk_limit):
                 chunk_end = current_pos + len(chunk)
@@ -466,17 +466,30 @@ class FileServer:
                 
                 if chunk_start < chunk_end_trim:
                     chunk_data = chunk[chunk_start:chunk_end_trim]
-                    await response.write(chunk_data)
-                    bytes_sent += len(chunk_data)
+                    try:
+                        await response.write(chunk_data)
+                        bytes_sent += len(chunk_data)
+                    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+                        # Client disconnected (normal during seeking/pausing)
+                        return response
                 
                 current_pos += len(chunk)
             
-            await response.write_eof()
+            try:
+                await response.write_eof()
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+                pass
             
             logger.debug(f"Range request served: {bytes_sent} bytes ({start}-{end})")
             return response
             
+        except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+             # Top level catch for connection issues
+             return response
         except Exception as e:
+            if "Cannot write to closing transport" in str(e):
+                # Specific aiohttp error that matches the logs
+                return response
             logger.error(f"Error handling range request: {e}")
             raise web.HTTPInternalServerError(text="Range request error")
 
